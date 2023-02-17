@@ -136,9 +136,9 @@ wandb/
 .DS_Store
 
 # Neural Network weights -----------------------------------------------------------------------------------------------
-weights/
+# weights/
 *.weights
-*.pt
+./*.pt
 *.pb
 *.onnx
 *.engine
@@ -150,3 +150,8 @@ weights/
 *_web_model/
 *_openvino_model/
 *_paddle_model/
+yolov8n.pt
+yolov8n-seg.pt
+tmp
+.conda
+.venv
