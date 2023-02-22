@@ -1,7 +1,7 @@
 task: detect
 mode: train
 model: yolov8n.pt
-data: /efs/players/to122838/projects/yolov8lard/datasets/lard/div0/dataset.yaml
+data: /efs/players/to122838/projects/yolov8lard/datasets/lard/div0/detect/dataset.yaml
 epochs: 20
 patience: 50
 batch: 112
@@ -96,4 +96,4 @@ mixup: 0.0
 copy_paste: 0.0
 cfg: null
 v5loader: false
-save_dir: /efs/players/to122838/projects/yolov8lard/runs/detect/train22
+save_dir: /efs/players/to122838/projects/yolov8lard/runs/detect/train32
