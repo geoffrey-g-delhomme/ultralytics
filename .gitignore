@@ -155,3 +155,4 @@ yolov8n-seg.pt
 tmp
 .conda
 .venv
+.vscode

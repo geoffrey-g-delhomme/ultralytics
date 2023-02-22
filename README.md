@@ -1,3 +1,15 @@
+This repository contains material to train YOLOv8 neural network on the LARD dataset, for both detection and segmentation tasks.
+
+| task    | weights    | epochs | mAP50 (%) | params (M) | FLOPs (G) | latency (ms) |
+| ------- | ---------- | ------ | --------- | ---------- | --------- | ------------ |
+| segment | pretrained | 20     | 99.1      | 3.26       | 12.0      | 15.5         |
+| segment | scratch    | 40     | 98.1      | 3.26       | 12.0      | 15.5         |
+| detect  | pretrained | 20     | 99.4      | 3.01       | 8.1       | 11.7         |
+| detect  | scratch    | 40     | 98.5      | 3.01       | 8.1       | 11.7         |
+
+____
+
+
 <div align="center">
   <p>
     <a href="https://ultralytics.com/yolov8" target="_blank">
