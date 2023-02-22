@@ -1,4 +1,4 @@
-This repository contains material to train YOLOv8 neural network on the LARD dataset, for both detection and segmentation tasks.
+This repository contains material to train YOLOv8 neural network on the [LARD](https://github.com/deel-ai/LARD) dataset, for both detection and segmentation tasks, with following performance metrics:
 
 | task    | weights    | epochs | mAP50 (%) | params (M) | FLOPs (G) | latency (ms) |
 | ------- | ---------- | ------ | --------- | ---------- | --------- | ------------ |
