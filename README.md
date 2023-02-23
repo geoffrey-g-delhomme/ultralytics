@@ -1,4 +1,8 @@
+# YOLOv8 + LARD
+
 This repository contains material to train YOLOv8 neural network on the [LARD](https://github.com/deel-ai/LARD) dataset, for both detection and segmentation tasks, with following performance metrics:
+
+## Metrics
 
 | task    | weights    | epochs | mAP50 (%) | params (M) | FLOPs (G) | latency (ms) |
 | ------- | ---------- | ------ | --------- | ---------- | --------- | ------------ |
@@ -7,11 +11,15 @@ This repository contains material to train YOLOv8 neural network on the [LARD](h
 | detect  | pretrained | 20     | 99.4      | 3.01       | 8.1       | 11.7         |
 | detect  | scratch    | 40     | 98.5      | 3.01       | 8.1       | 11.7         |
 
+## Preview
+
+### Landing in Paphos
 
 [![YOLOv8 + LARD - Paphos](http://img.youtube.com/vi/pxtzVf2Ky-I/0.jpg)](http://www.youtube.com/watch?v=pxtzVf2Ky-I "YOLOv8 + LARD - Paphos")
 
-[![YOLOv8 + LARD - Palerme](http://img.youtube.com/vi/_scL7baPA6c/0.jpg)](http://www.youtube.com/watch?v=_scL7baPA6c "YOLOv8 + LARD - Palerme")
+### Landing in Palerme
 
+[![YOLOv8 + LARD - Palerme](http://img.youtube.com/vi/_scL7baPA6c/0.jpg)](http://www.youtube.com/watch?v=_scL7baPA6c "YOLOv8 + LARD - Palerme")
 
 ____
 
