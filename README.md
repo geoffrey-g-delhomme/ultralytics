@@ -6,7 +6,7 @@ This repository contains material to train YOLOv8 neural network on the [LARD](h
 
 ## Metrics
 
-| task    | weights    | epochs | mAP50 (%) | params (M) | FLOPs (G) | latency (ms) |
+| task    | weights    | epochs | mAP<sup>val<br>50<br>(%) | params<br>(M) | FLOPs<br>(B) | latency<br>(ms) |
 | ------- | ---------- | ------ | --------- | ---------- | --------- | ------------ |
 | segment | pretrained | 20     | 99.1      | 3.26       | 12.0      | 15.5         |
 | segment | scratch    | 40     | 98.1      | 3.26       | 12.0      | 15.5         |
