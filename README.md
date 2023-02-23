@@ -4,6 +4,10 @@ This repository contains material to train YOLOv8 neural network on the [LARD](h
 
 **All the material is accessible from the `LARD.ipynb` notebook.**
 
+## Models
+
+All model checkpoints, ONNX exports and generated figures are stored in the `results` folder.
+
 ## Metrics
 
 | task    | weights    | epochs | mAP<sup>val<br>50<br>(%) | params<br>(M) | FLOPs<br>(B) | latency<br>(ms) |
