@@ -50,3 +50,4 @@ plotly
 nbformat
 isort
 py-markdown-table
+certifi>=2022.12.7 # not directly required, pinned by Snyk to avoid a vulnerability
