@@ -24,7 +24,7 @@ from tqdm import tqdm
 from ultralytics.cfg import get_cfg
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.nn.tasks import attempt_load_one_weight, attempt_load_weights
-from ultralytics.utils import (DEFAULT_CFG, LOGGER, RANK, SETTINGS, TQDM_BAR_FORMAT, __version__, callbacks, clean_url,
+from ultralytics.utils import (DEFAULT_CFG, LOCAL_RANK, LOGGER, RANK, SETTINGS, TQDM_BAR_FORMAT, WORLD_SIZE, __version__, callbacks, clean_url,
                                colorstr, emojis, yaml_save)
 from ultralytics.utils.autobatch import check_train_batch_size
 from ultralytics.utils.checks import check_amp, check_file, check_imgsz, print_args
@@ -166,7 +166,9 @@ class BaseTrainer:
 
     def train(self):
         """Allow device='', device=None on Multi-GPU systems to default to device=0."""
-        if isinstance(self.args.device, int) or self.args.device:  # i.e. device=0 or device=[0,1,2,3]
+        if "WORLD_SIZE" in os.environ:
+            world_size = WORLD_SIZE
+        elif isinstance(self.args.device, int) or self.args.device:  # i.e. device=0 or device=[0,1,2,3]
             world_size = torch.cuda.device_count()
         elif torch.cuda.is_available():  # i.e. device=None or device=''
             world_size = 1  # default to device 0
@@ -193,13 +195,13 @@ class BaseTrainer:
 
     def _setup_ddp(self, world_size):
         """Initializes and sets the DistributedDataParallel parameters for training."""
-        torch.cuda.set_device(RANK)
-        self.device = torch.device('cuda', RANK)
+        torch.cuda.set_device(LOCAL_RANK)
+        self.device = torch.device('cuda', LOCAL_RANK)
         LOGGER.info(f'DDP info: RANK {RANK}, WORLD_SIZE {world_size}, DEVICE {self.device}')
         os.environ['NCCL_BLOCKING_WAIT'] = '1'  # set to enforce timeout
         dist.init_process_group(
             'nccl' if dist.is_nccl_available() else 'gloo',
-            timeout=timedelta(seconds=10800),  # 3 hours
+            timeout=timedelta(seconds=8*60*60),  # 8 hours
             rank=RANK,
             world_size=world_size)
 
@@ -223,7 +225,7 @@ class BaseTrainer:
         self.amp = bool(self.amp)  # as boolean
         self.scaler = amp.GradScaler(enabled=self.amp)
         if world_size > 1:
-            self.model = DDP(self.model, device_ids=[RANK])
+            self.model = DDP(self.model, device_ids=[LOCAL_RANK])
         # Check imgsz
         gs = max(int(self.model.stride.max() if hasattr(self.model, 'stride') else 32), 32)  # grid size (max stride)
         self.args.imgsz = check_imgsz(self.args.imgsz, stride=gs, floor=gs, max_dim=1)
