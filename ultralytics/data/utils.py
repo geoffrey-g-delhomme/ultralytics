@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps
 from tqdm import tqdm
+import glob
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.utils import (DATASETS_DIR, LOGGER, NUM_THREADS, ROOT, SETTINGS_YAML, clean_url, colorstr, emojis,
@@ -566,3 +567,30 @@ def autosplit(path=DATASETS_DIR / 'coco8/images', weights=(0.9, 0.1, 0.0), annot
         if not annotated_only or Path(img2label_paths([str(img)])[0]).exists():  # check label
             with open(path.parent / txt[i], 'a') as f:
                 f.write(f'./{img.relative_to(path.parent).as_posix()}' + '\n')  # add image to txt file
+
+def get_img_files(img_path, fraction, prefix):
+
+    """Read image files."""
+    try:
+        f = []  # image files
+        for p in img_path if isinstance(img_path, list) else [img_path]:
+            p = Path(p)  # os-agnostic
+            if p.is_dir():  # dir
+                f += glob.glob(str(p / '**' / '*.*'), recursive=True)
+                # F = list(p.rglob('*.*'))  # pathlib
+            elif p.is_file():  # file
+                with open(p) as t:
+                    t = t.read().strip().splitlines()
+                    parent = str(p.parent) + os.sep
+                    f += [x.replace('./', parent) if x.startswith('./') else x for x in t]  # local to global path
+                    # F += [p.parent / x.lstrip(os.sep) for x in t]  # local to global path (pathlib)
+            else:
+                raise FileNotFoundError(f'{prefix}{p} does not exist')
+        im_files = sorted(x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in IMG_FORMATS)
+        # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in IMG_FORMATS])  # pathlib
+        assert im_files, f'{prefix}No images found'
+    except Exception as e:
+        raise FileNotFoundError(f'{prefix}Error loading data from {img_path}\n{HELP_URL}') from e
+    if fraction < 1:
+        im_files = im_files[:round(len(im_files) * fraction)]
+    return im_files

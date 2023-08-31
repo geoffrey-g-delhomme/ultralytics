@@ -35,6 +35,8 @@ from ultralytics.utils.files import increment_path
 from ultralytics.utils.ops import Profile
 from ultralytics.utils.torch_utils import de_parallel, select_device, smart_inference_mode
 
+from torchdata.dataloader2 import DataLoader2
+
 
 class BaseValidator:
     """
@@ -159,7 +161,10 @@ class BaseValidator:
             model.warmup(imgsz=(1 if pt else self.args.batch, 3, imgsz, imgsz))  # warmup
 
         dt = Profile(), Profile(), Profile(), Profile()
-        n_batches = len(self.dataloader)
+        if isinstance(self.dataloader, DataLoader2):
+            n_batches = self.dataloader.num_batches
+        else:
+            n_batches = len(self.dataloader)
         desc = self.get_desc()
         # NOTE: keeping `not self.training` in tqdm will eliminate pbar after segmentation evaluation during training,
         # which may affect classification task since this arg is in yolov5/classify/val.py.
@@ -195,13 +200,19 @@ class BaseValidator:
             self.run_callbacks('on_val_batch_end')
         stats = self.get_stats()
         self.check_stats(stats)
-        self.speed = dict(zip(self.speed.keys(), (x.t / len(self.dataloader.dataset) * 1E3 for x in dt)))
+        if isinstance(self.dataloader, DataLoader2):
+            self.speed = dict(zip(self.speed.keys(), (x.t / self.dataloader.num_samples * 1E3 for x in dt)))
+        else:
+            self.speed = dict(zip(self.speed.keys(), (x.t / len(self.dataloader.dataset) * 1E3 for x in dt)))
         self.finalize_metrics()
         self.print_results()
         self.run_callbacks('on_val_end')
         if self.training:
             model.float()
-            results = {**stats, **trainer.label_loss_items(self.loss.cpu() / len(self.dataloader), prefix='val')}
+            if isinstance(self.dataloader, DataLoader2):
+                results = {**stats, **trainer.label_loss_items(self.loss.cpu() / self.dataloader.num_batches, prefix='val')}
+            else:
+                results = {**stats, **trainer.label_loss_items(self.loss.cpu() / len(self.dataloader), prefix='val')}
             return {k: round(float(v), 5) for k, v in results.items()}  # return results as 5 decimal place floats
         else:
             LOGGER.info('Speed: %.1fms preprocess, %.1fms inference, %.1fms loss, %.1fms postprocess per image' %

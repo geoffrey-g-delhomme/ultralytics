@@ -1,24 +1,37 @@
 # Ultralytics YOLO 🚀, AGPL-3.0 license
 import contextlib
-from itertools import repeat
+from itertools import repeat, islice
 from multiprocessing.pool import ThreadPool
+from multiprocessing import Lock
 from pathlib import Path
+import copy
+import torchvision.transforms as transforms
+import PIL.Image
+import torchdata
 
 import cv2
 import numpy as np
 import torch
 import torchvision
 from tqdm import tqdm
+import webdataset as wds
+import io
+import json
+import os
+from functools import partial
 
 from ultralytics.utils import LOCAL_RANK, NUM_THREADS, TQDM_BAR_FORMAT, colorstr, is_dir_writeable
 
-from .augment import Compose, Format, Instances, LetterBox, classify_albumentations, classify_transforms, v8_transforms
+from .augment import Compose, Format, Instances, LetterBox, classify_albumentations, classify_transforms, v8_transforms, CopyPaste, RandomFlip, Albumentations, RandomPerspective, RandomHSV
 from .base import BaseDataset
-from .utils import HELP_URL, LOGGER, get_hash, img2label_paths, verify_image, verify_image_label
+from .utils import HELP_URL, LOGGER, get_hash, img2label_paths, verify_image, verify_image_label, get_img_files
+
+from torch.utils.data import IterableDataset
+import torchvision.transforms as T
 
 # Ultralytics dataset *.cache version, >= 1.0.0 for YOLOv8
 DATASET_CACHE_VERSION = '1.0.3'
-
+WDS_SHARDED = True
 
 class YOLODataset(BaseDataset):
     """
@@ -164,7 +177,7 @@ class YOLODataset(BaseDataset):
         # NOTE: cls is not with bboxes now, classification and semantic segmentation need an independent cls label
         # we can make it also support classification and semantic segmentation by add or remove some dict keys there.
         bboxes = label.pop('bboxes')
-        segments = label.pop('segments')
+        segments = label.pop('segments', [])
         keypoints = label.pop('keypoints', None)
         bbox_format = label.pop('bbox_format')
         normalized = label.pop('normalized')
@@ -319,6 +332,296 @@ def save_dataset_cache_file(prefix, path, x):
         LOGGER.info(f'{prefix}New cache created: {path}')
     else:
         LOGGER.warning(f'{prefix}WARNING ⚠️ Cache directory {path.parent} is not writeable, cache not saved.')
+
+
+def load_wds_info_file(info_filepath: Path):
+    return load_dataset_cache_file(info_filepath)
+
+
+def save_wds_info_file(prefix, info_filepath, cache):
+    cache['version'] = DATASET_CACHE_VERSION  # add cache version
+    if is_dir_writeable(info_filepath.parent):
+        if info_filepath.exists():
+            info_filepath.unlink()
+        np.save(str(info_filepath), cache)  # save cache for next time
+        info_filepath.with_suffix('.wdsinfo.npy').rename(info_filepath)  # remove .npy suffix
+        LOGGER.info(f'{prefix}New cache created: {info_filepath}')
+    else:
+        LOGGER.warning(f'{prefix}WARNING ⚠️ Cache directory {info_filepath.parent} is not writeable, cache not saved.')
+
+
+def wds_encode_sample(sink, lock, sample):
+    s = {
+        '__key__': Path(sample['im_file']).stem
+    }
+    img = sample.pop('img')
+
+    _, im_buf_arr = cv2.imencode('.png', cv2.cvtColor(img.permute(1, 2, 0).numpy(), cv2.COLOR_RGB2BGR))
+    s['png'] = im_buf_arr.tobytes()
+
+    for k in ['cls', 'bboxes', 'keypoints', 'batch_idx']:
+        if k in sample.keys() and isinstance(sample[k], torch.Tensor):
+            sample[k] = sample[k].tolist()
+    for k in ['resized_shape']:
+        if k in sample.keys() and isinstance(sample[k], np.ndarray):
+            sample[k] = sample[k].tolist()
+    s['json'] = bytes(json.dumps(sample), 'utf-8')
+
+    lock.acquire()
+    try:
+        sink.write(s)
+    finally:
+        lock.release()
+
+
+def _cache_wds(info_filepath, prefix, cfg, img_path, batch, data, mode, rect, stride):
+
+    dataset = YOLODataset(
+        img_path=img_path,
+        imgsz=cfg.imgsz,
+        batch_size=batch,
+        augment=False,  # augmentation
+        hyp=cfg,  # TODO: probably add a get_hyps_from_cfg function
+        rect=cfg.rect or rect,  # rectangular batches
+        cache=False, # Force to false
+        single_cls=cfg.single_cls or False,
+        stride=int(stride),
+        pad=0.0 if mode == 'train' else 0.5,
+        prefix=colorstr(f'{mode}: '),
+        use_segments=cfg.task == 'segment',
+        use_keypoints=cfg.task == 'pose',
+        classes=cfg.classes,
+        data=data,
+        fraction=cfg.fraction if mode == 'train' else 1.0)
+
+    if WDS_SHARDED:
+        # TODO: move sharded to a subdir
+        pattern = info_filepath.parent / (info_filepath.stem + "-%09d.tar")
+        sink = wds.ShardWriter(
+            pattern=pattern.as_posix(),
+            maxcount=int(os.environ.get('WDS_SHARDED_MAXCOUNT', str(int(1e3)))),
+            maxsize=int(os.environ.get('WDS_SHARDED_MAXSIZE', str(int(1 * 1e9)))), # 1GB
+            encoder=False)
+    else:
+        tar_filepath = info_filepath.parent / (info_filepath.stem + ".tar")
+        if tar_filepath.exists():
+            os.unlink(tar_filepath.as_posix())
+        sink = wds.TarWriter(tar_filepath.as_posix(), encoder=False)
+
+    desc = f'{prefix}Caching as webdataset...'
+    total = len(dataset)
+    pbar = tqdm(dataset, desc=desc, total=total, bar_format=TQDM_BAR_FORMAT)
+    lock = Lock()
+
+    with ThreadPool(int(os.environ.get('WDS_THREAD_POOL_SIZE', os.cpu_count()))) as pool:
+        for _ in pool.imap(func=partial(wds_encode_sample, sink, lock), iterable=pbar):
+            pass
+    pbar.close()
+
+    if WDS_SHARDED:
+        shards = sink.shard - 1 if sink.count == 0 else sink.shard
+    else:
+        shards = None
+
+    sink.close()
+
+    return total, shards
+
+
+def wds_decoder(s):
+
+    sample = json.load(s['.json'])
+
+    img = np.asarray(bytearray(s['.png'].read()), dtype="uint8")
+    img = cv2.imdecode(img, cv2.IMREAD_COLOR)
+    sample['img'] = img
+
+    for k in ['resized_shape', 'cls', 'bboxes', 'keypoints', 'batch_idx']:
+        if k in sample:
+            sample[k] = np.array(sample[k])
+
+    return sample
+
+def wds_format(sample):
+
+    img = np.ascontiguousarray(sample['img'].transpose(2, 0, 1)[::-1])
+    sample['img'] = torch.from_numpy(img)
+
+    for k in ['cls', 'bboxes', 'keypoints', 'batch_idx']:
+        if k in sample:
+            sample[k] = torch.from_numpy(sample[k])
+
+    return sample
+
+
+def single_node_only(src, group=None):
+    # rank, world_size, worker, num_workers = utils.pytorch_worker_info(group=group)
+    # if world_size > 1:
+    #     raise ValueError(
+    #         "you need to add an explicit nodesplitter to your input pipeline for multi-node training"
+    #     )
+    for s in src:
+        yield s
+
+
+def wds_update_labels(sample):
+    sample['bbox_format'] = 'xywh'
+    sample['normalized'] = True
+    return YOLODataset.update_labels_info(None, sample)
+
+
+def build_transforms(hyp, data):
+    """Builds and appends transforms to the list."""
+    """Convert images to a size suitable for YOLOv8 training."""
+    stretch = False
+    use_segments = hyp.task == 'segment'
+    use_keypoints = hyp.task == 'pose'
+    imgsz = hyp.imgsz
+    pre_transform = Compose([
+        # Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic),
+        CopyPaste(p=hyp.copy_paste),
+        RandomPerspective(
+            degrees=hyp.degrees,
+            translate=hyp.translate,
+            scale=hyp.scale,
+            shear=hyp.shear,
+            perspective=hyp.perspective,
+            pre_transform=None if stretch else LetterBox(new_shape=(imgsz, imgsz)),
+        )])
+    flip_idx = data.get('flip_idx', [])  # for keypoints augmentation
+    if use_keypoints:
+        kpt_shape = data.get('kpt_shape', None)
+        if len(flip_idx) == 0 and hyp.fliplr > 0.0:
+            hyp.fliplr = 0.0
+            LOGGER.warning("WARNING ⚠️ No 'flip_idx' array defined in data.yaml, setting augmentation 'fliplr=0.0'")
+        elif flip_idx and (len(flip_idx) != kpt_shape[0]):
+            raise ValueError(f'data.yaml flip_idx={flip_idx} length must be equal to kpt_shape[0]={kpt_shape[0]}')
+
+    transforms = Compose([
+        pre_transform,
+        # MixUp(dataset, pre_transform=pre_transform, p=hyp.mixup),
+        Albumentations(p=1.0),
+        RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
+        RandomFlip(direction='vertical', p=hyp.flipud),
+        RandomFlip(direction='horizontal', p=hyp.fliplr, flip_idx=flip_idx)])  # transforms
+
+    transforms.append(
+        Format(bbox_format='xywh',
+                normalize=True,
+                return_mask=use_segments,
+                return_keypoint=use_keypoints,
+                batch_idx=True,
+                mask_ratio=hyp.mask_ratio,
+                mask_overlap=hyp.overlap_mask))
+    return transforms
+
+
+def split_by_node(src, group=None):
+    rank, world_size, worker, num_workers = wds.utils.pytorch_worker_info(group=group)
+    LOGGER.info(f"########## splitter: rank {rank} / {world_size}")
+    if world_size > 1:
+        for s in islice(src, rank*num_workers+worker, None, world_size*num_workers):
+            yield s
+    else:
+        for s in src:
+            yield s
+
+
+def get_wds_dataset(cfg, img_path, batch, data, mode, rect, stride):
+
+    prefix = colorstr(f'{mode}: ')
+
+    check_cache = os.environ.get('WDS_CHECK_CACHE', '1').lower() in ('yes', 'true', '1')
+
+    if check_cache:
+        im_files = get_img_files(img_path, cfg.fraction, prefix)
+        label_files = img2label_paths(im_files)
+        cache_hash = get_hash(label_files + im_files)
+        info_filepath = Path(label_files[0]).parent.with_suffix('.wdsinfo')
+    else:
+        LOGGER.warn("Skip webdataset cache checking")
+        info_filepath = Path(img_path.replace('/images/', '/labels/')).with_suffix('.wdsinfo')
+        LOGGER.info(f"Webdataset info filepath: {info_filepath.as_posix()}")
+    try:
+        info = load_wds_info_file(info_filepath)
+        assert info['version'] == DATASET_CACHE_VERSION  # matches current version
+        assert not check_cache or info['hash'] == cache_hash  # identical hash
+    except (FileNotFoundError, AssertionError, AttributeError):
+        LOGGER.info("Start webdataset caching ...")
+        if not check_cache:
+            im_files = get_img_files(img_path, cfg.fraction, prefix)
+            label_files = img2label_paths(im_files)
+            cache_hash = get_hash(label_files + im_files)
+        total, shards = _cache_wds(info_filepath, prefix, cfg, img_path, batch, data, mode, rect, stride)
+        info = {
+            'hash': cache_hash,
+            'total': total,
+            'shards': shards
+        }
+        save_wds_info_file(prefix, info_filepath, info)
+
+    LOGGER.info("Create webdataset ...")
+
+    # args = []
+    # if info['shards'] is not None:
+    #     url = info_filepath.parent.as_posix() + "/" + (info_filepath.stem + ("-{%09d..%09d}.tar" % (0, info['shards']-1)))
+    #     args.append(wds.ResampledShards(url))
+    # else:
+    #     url =  (info_filepath.parent / (info_filepath.stem + ".tar")).as_posix()
+    #     args.append(wds.SimpleShardList([url]))
+    # if mode == "train":
+    #     pool_size = min(int(os.environ.get('WDS_SHUFFLE_POOL_SIZE', '1000')), info['total'])
+    #     args.append(wds.shuffle(pool_size))
+    # # args.append(wds.split_by_node)
+    # args.append(split_by_node)
+    # args.append(wds.tarfile_to_samples())
+    # # args.append(wds.decode('torchrgb8'))
+    # # args.append(wds.to_tuple('png', 'json'))
+    # args.append(wds.map(wds_decoder))
+    
+    # dataset = wds.DataPipeline(*args)
+    # dataset = wds.with_epoch(dataset, info['total'])
+    # dataset = wds.with_length(dataset, info['total'])
+    # dataset.collate_fn = YOLODataset.collate_fn
+    # return dataset
+        
+    # if info['shards'] is not None:
+    #     url = info_filepath.parent.as_posix() + "/" + (info_filepath.stem + ("-{%09d..%09d}.tar" % (0, info['shards']-1)))
+    #     dataset = wds.WebDataset(url, shardshuffle=mode == "train", nodesplitter=split_by_node)
+    # else:
+    #     tar_filepath =  info_filepath.parent / (info_filepath.stem + ".tar")
+    #     dataset = wds.WebDataset(tar_filepath.as_posix())
+    # dataset = dataset.with_length(info['total'])
+    # if mode == "train":
+    #     pool_size = min(int(os.environ.get('WDS_SHUFFLE_POOL_SIZE', '1000')), info['total'])
+    #     dataset = dataset.shuffle(pool_size)
+    # dataset = dataset.map(wds_decoder)
+    # dataset.collate_fn = YOLODataset.collate_fn
+    # return dataset
+
+    if info['shards'] is not None:
+        urls = [(info_filepath.parent / f"{info_filepath.stem}-{i:09d}.tar").as_posix() for i in range(info['shards'])]
+    else:
+        urls =  [info_filepath.parent / (info_filepath.stem + ".tar")]
+
+    dp = torchdata.datapipes.iter.FileOpener(urls, mode="b")
+    dp = dp.load_from_tar(length=info['total'])
+    dp = dp.webdataset()
+    if mode == "train":
+        dp = dp.shuffle()
+    dp = dp.sharding_filter()
+    dp = dp.map(wds_decoder)
+    if mode == "train":
+        dp = dp.map(wds_update_labels)
+        transforms = build_transforms(cfg, data)
+        dp = dp.map(transforms)
+    else:
+        dp = dp.map(wds_format)
+    dp.collate_fn = YOLODataset.collate_fn
+    return dp
+
+
+
 
 
 # TODO: support semantic segmentation

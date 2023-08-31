@@ -15,8 +15,12 @@ from ultralytics.data.utils import IMG_FORMATS, VID_FORMATS
 from ultralytics.utils import RANK, colorstr
 from ultralytics.utils.checks import check_file
 
-from .dataset import YOLODataset
-from .utils import PIN_MEMORY
+from .dataset import YOLODataset, get_wds_dataset
+from .utils import PIN_MEMORY, LOGGER
+
+from torchdata.dataloader2 import DataLoader2
+from torchdata.dataloader2.adapter import Shuffle
+from torchdata.dataloader2.reading_service import DistributedReadingService, MultiProcessingReadingService, SequentialReadingService
 
 
 class InfiniteDataLoader(dataloader.DataLoader):
@@ -71,34 +75,87 @@ def seed_worker(worker_id):  # noqa
 
 def build_yolo_dataset(cfg, img_path, batch, data, mode='train', rect=False, stride=32):
     """Build YOLO Dataset"""
-    return YOLODataset(
-        img_path=img_path,
-        imgsz=cfg.imgsz,
-        batch_size=batch,
-        augment=mode == 'train',  # augmentation
-        hyp=cfg,  # TODO: probably add a get_hyps_from_cfg function
-        rect=cfg.rect or rect,  # rectangular batches
-        cache=cfg.cache or None,
-        single_cls=cfg.single_cls or False,
-        stride=int(stride),
-        pad=0.0 if mode == 'train' else 0.5,
-        prefix=colorstr(f'{mode}: '),
-        use_segments=cfg.task == 'segment',
-        use_keypoints=cfg.task == 'pose',
-        classes=cfg.classes,
-        data=data,
-        fraction=cfg.fraction if mode == 'train' else 1.0)
+    if cfg.cache == "wds":
+        return get_wds_dataset(cfg, img_path, batch, data, mode, rect, stride)
+    else:
+        return YOLODataset(
+            img_path=img_path,
+            imgsz=cfg.imgsz,
+            batch_size=batch,
+            augment=mode == 'train',  # augmentation
+            hyp=cfg,  # TODO: probably add a get_hyps_from_cfg function
+            rect=cfg.rect or rect,  # rectangular batches
+            cache=cfg.cache or None,
+            single_cls=cfg.single_cls or False,
+            stride=int(stride),
+            pad=0.0 if mode == 'train' else 0.5,
+            prefix=colorstr(f'{mode}: '),
+            use_segments=cfg.task == 'segment',
+            use_keypoints=cfg.task == 'pose',
+            classes=cfg.classes,
+            data=data,
+            fraction=cfg.fraction if mode == 'train' else 1.0)
 
 
 def build_dataloader(dataset, batch, workers, shuffle=True, rank=-1):
     """Return an InfiniteDataLoader or DataLoader for training or validation set."""
-    batch = min(batch, len(dataset))
+    try:
+        batch = min(batch, len(dataset))
+    except TypeError:
+        pass
     nd = torch.cuda.device_count()  # number of CUDA devices
     nw = min([os.cpu_count() // max(nd, 1), batch if batch > 1 else 0, workers])  # number of workers
     sampler = None if rank == -1 else distributed.DistributedSampler(dataset, shuffle=shuffle)
     generator = torch.Generator()
     generator.manual_seed(6148914691236517205 + RANK)
-    return InfiniteDataLoader(dataset=dataset,
+    if isinstance(dataset, torch.utils.data.IterDataPipe):
+        collate_fn = getattr(dataset, 'collate_fn', None)
+        # dp = dataset.sharding_filter()
+        dp = dataset
+        num_samples = len(dp)
+        dp = dp.batch(batch)
+        dp = dp.collate(collate_fn)
+        num_batches = len(dp)
+        dp = dp.pin_memory()
+        # dp = dp.fullsync()
+
+        mp_rs = MultiProcessingReadingService(num_workers=nw)
+        if rank != -1:
+            dist_rs = DistributedReadingService(timeout=30)
+            rs = SequentialReadingService(dist_rs, mp_rs)
+        else:
+            rs = mp_rs
+
+        dl = DataLoader2(dp, [Shuffle(shuffle)], reading_service=rs)
+        dl.num_workers = nw
+        dl.batch_size = batch
+        dl.num_batches = num_batches
+        dl.num_samples = num_samples
+        return dl
+    # if isinstance(dataset, torch.utils.data.IterDataPipe):DistributedReadingService
+    #     collate_fn = getattr(dataset, 'collate_fn', None)
+    #     dp = dataset
+    #     # dp = dp.batch(batch)
+    #     # dp = dp.collate(collate_fn)
+    #     LOGGER.info(f"dataset length: {len(dp)}")
+    #     # TODO: Apply distributed sharding here ?
+    #     # TODO: Check worker sharding next ?
+    #     torch.utils.data.graph_settings.apply_shuffle_settings(dp, shuffle=shuffle)
+    #     dl = dataloader.DataLoader(dataset=dp,
+    #                         #   prefetch_factor=4,
+    #                           batch_size=batch,
+    #                         #   shuffle=False,
+    #                           num_workers=nw,
+    #                           pin_memory=PIN_MEMORY,
+    #                           collate_fn=collate_fn,
+    #                           drop_last=True,
+    #                         #   worker_init_fn=seed_worker,
+    #                         #   generator=generator
+    #                           )
+    #     LOGGER.info("dataloader created")
+    #     return dl
+    else:
+        return InfiniteDataLoader(dataset=dataset,
                               batch_size=batch,
                               shuffle=shuffle and sampler is None,
                               num_workers=nw,

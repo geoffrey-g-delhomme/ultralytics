@@ -35,6 +35,8 @@ from ultralytics.utils.files import get_latest_run, increment_path
 from ultralytics.utils.torch_utils import (EarlyStopping, ModelEMA, de_parallel, init_seeds, one_cycle, select_device,
                                            strip_optimizer)
 
+from torchdata.dataloader2 import DataLoader2
+
 
 class BaseTrainer:
     """
@@ -199,9 +201,13 @@ class BaseTrainer:
         self.device = torch.device('cuda', RANK)
         LOGGER.info(f'DDP info: RANK {RANK}, WORLD_SIZE {world_size}, DEVICE {self.device}')
         os.environ['NCCL_BLOCKING_WAIT'] = '1'  # set to enforce timeout
+        nccl_timeout_s = 10800 # 3h
+        if "NCCL_INIT_TIMEOUT" in os.environ:
+            nccl_timeout_s = int(os.environ['NCCL_INIT_TIMEOUT'])
+            LOGGER.info(f"Set NCCL init timeout to {nccl_timeout_s} seconds")
         dist.init_process_group(
             'nccl' if dist.is_nccl_available() else 'gloo',
-            timeout=timedelta(seconds=10800),  # 3 hours
+            timeout=timedelta(seconds=nccl_timeout_s),  # 3 hours
             rank=RANK,
             world_size=world_size)
 
@@ -271,7 +277,13 @@ class BaseTrainer:
         # Optimizer
         self.accumulate = max(round(self.args.nbs / self.batch_size), 1)  # accumulate loss before optimizing
         weight_decay = self.args.weight_decay * self.batch_size * self.accumulate / self.args.nbs  # scale weight_decay
-        iterations = math.ceil(len(self.train_loader.dataset) / max(self.batch_size, self.args.nbs)) * self.epochs
+        if isinstance(self.train_loader, DataLoader2):
+            LOGGER.info(f"Train dataloader num_batches {self.train_loader.num_batches}")
+            LOGGER.info(f"Train dataloader batch_size {self.train_loader.batch_size}")
+            LOGGER.info(f"Train dataloader num_samples {self.train_loader.num_samples}")
+            iterations = math.ceil(self.train_loader.num_batches / world_size) * self.epochs
+        else:
+            iterations = math.ceil(len(self.train_loader.dataset) / max(self.batch_size, self.args.nbs)) * self.epochs
         self.optimizer = self.build_optimizer(model=self.model,
                                               name=self.args.optimizer,
                                               lr=self.args.lr0,
@@ -298,7 +310,10 @@ class BaseTrainer:
         self.epoch_time = None
         self.epoch_time_start = time.time()
         self.train_time_start = time.time()
-        nb = len(self.train_loader)  # number of batches
+        if isinstance(self.train_loader, DataLoader2):
+            nb = math.ceil(self.train_loader.num_batches / world_size)
+        else:
+            nb = len(self.train_loader)  # number of batches
         nw = max(round(self.args.warmup_epochs *
                        nb), 100) if self.args.warmup_epochs > 0 else -1  # number of warmup iterations
         last_opt_step = -1
@@ -315,17 +330,20 @@ class BaseTrainer:
             self.epoch = epoch
             self.run_callbacks('on_train_epoch_start')
             self.model.train()
-            if RANK != -1:
+            if RANK != -1 and hasattr(self.train_loader, 'sampler') and hasattr(self.train_loader.sampler, 'set_epoch'):
                 self.train_loader.sampler.set_epoch(epoch)
             pbar = enumerate(self.train_loader)
             # Update dataloader attributes (optional)
             if epoch == (self.epochs - self.args.close_mosaic):
                 LOGGER.info('Closing dataloader mosaic')
-                if hasattr(self.train_loader.dataset, 'mosaic'):
-                    self.train_loader.dataset.mosaic = False
-                if hasattr(self.train_loader.dataset, 'close_mosaic'):
-                    self.train_loader.dataset.close_mosaic(hyp=self.args)
-                self.train_loader.reset()
+                if not isinstance(self.train_loader, DataLoader2):
+                    if hasattr(self.train_loader.dataset, 'mosaic'):
+                        self.train_loader.dataset.mosaic = False
+                    if hasattr(self.train_loader.dataset, 'close_mosaic'):
+                        self.train_loader.dataset.close_mosaic(hyp=self.args)
+                    self.train_loader.reset()
+                else:
+                    LOGGER.warn("Not supported with DataLoader2")
 
             if RANK in (-1, 0):
                 LOGGER.info(self.progress_string())
@@ -630,10 +648,14 @@ class BaseTrainer:
         self.start_epoch = start_epoch
         if start_epoch > (self.epochs - self.args.close_mosaic):
             LOGGER.info('Closing dataloader mosaic')
-            if hasattr(self.train_loader.dataset, 'mosaic'):
-                self.train_loader.dataset.mosaic = False
-            if hasattr(self.train_loader.dataset, 'close_mosaic'):
-                self.train_loader.dataset.close_mosaic(hyp=self.args)
+            if not isinstance(self.train_loader, DataLoader2):
+                if hasattr(self.train_loader.dataset, 'mosaic'):
+                    self.train_loader.dataset.mosaic = False
+                if hasattr(self.train_loader.dataset, 'close_mosaic'):
+                    self.train_loader.dataset.close_mosaic(hyp=self.args)
+            else:
+                LOGGER.warn("Not supported with DataLoader2")
+                
 
     def build_optimizer(self, model, name='auto', lr=0.001, momentum=0.9, decay=1e-5, iterations=1e5):
         """

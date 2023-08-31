@@ -1,6 +1,5 @@
 # Ultralytics YOLO 🚀, AGPL-3.0 license
 
-import glob
 import math
 import os
 import random
@@ -17,8 +16,7 @@ from tqdm import tqdm
 
 from ultralytics.utils import DEFAULT_CFG, LOCAL_RANK, LOGGER, NUM_THREADS, TQDM_BAR_FORMAT
 
-from .utils import HELP_URL, IMG_FORMATS
-
+from .utils import HELP_URL, IMG_FORMATS, get_img_files
 
 class BaseDataset(Dataset):
     """
@@ -97,29 +95,7 @@ class BaseDataset(Dataset):
         self.transforms = self.build_transforms(hyp=hyp)
 
     def get_img_files(self, img_path):
-        """Read image files."""
-        try:
-            f = []  # image files
-            for p in img_path if isinstance(img_path, list) else [img_path]:
-                p = Path(p)  # os-agnostic
-                if p.is_dir():  # dir
-                    f += glob.glob(str(p / '**' / '*.*'), recursive=True)
-                    # F = list(p.rglob('*.*'))  # pathlib
-                elif p.is_file():  # file
-                    with open(p) as t:
-                        t = t.read().strip().splitlines()
-                        parent = str(p.parent) + os.sep
-                        f += [x.replace('./', parent) if x.startswith('./') else x for x in t]  # local to global path
-                        # F += [p.parent / x.lstrip(os.sep) for x in t]  # local to global path (pathlib)
-                else:
-                    raise FileNotFoundError(f'{self.prefix}{p} does not exist')
-            im_files = sorted(x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in IMG_FORMATS)
-            # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in IMG_FORMATS])  # pathlib
-            assert im_files, f'{self.prefix}No images found'
-        except Exception as e:
-            raise FileNotFoundError(f'{self.prefix}Error loading data from {img_path}\n{HELP_URL}') from e
-        if self.fraction < 1:
-            im_files = im_files[:round(len(im_files) * self.fraction)]
+        im_files = get_img_files(img_path, self.fraction, self.prefix)
         return im_files
 
     def update_labels(self, include_class: Optional[list]):
