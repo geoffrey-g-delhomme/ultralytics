@@ -78,7 +78,8 @@ def build_yolo_dataset(cfg, img_path, batch, data, mode='train', rect=False, str
     if cfg.cache == "wds":
         return get_wds_dataset(cfg, img_path, batch, data, mode, rect, stride)
     else:
-        return YOLODataset(
+        # return YOLODataset(
+        return YOLOIterDataset(
             img_path=img_path,
             imgsz=cfg.imgsz,
             batch_size=batch,
@@ -121,7 +122,7 @@ def build_dataloader(dataset, batch, workers, shuffle=True, rank=-1):
 
         mp_rs = MultiProcessingReadingService(num_workers=nw)
         if rank != -1:
-            dist_rs = DistributedReadingService(timeout=30)
+            dist_rs = DistributedReadingService()
             rs = SequentialReadingService(dist_rs, mp_rs)
         else:
             rs = mp_rs
@@ -155,15 +156,42 @@ def build_dataloader(dataset, batch, workers, shuffle=True, rank=-1):
     #     LOGGER.info("dataloader created")
     #     return dl
     else:
-        return InfiniteDataLoader(dataset=dataset,
-                              batch_size=batch,
-                              shuffle=shuffle and sampler is None,
-                              num_workers=nw,
-                              sampler=sampler,
-                              pin_memory=PIN_MEMORY,
-                              collate_fn=getattr(dataset, 'collate_fn', None),
-                              worker_init_fn=seed_worker,
-                              generator=generator)
+        if os.environ.get("USE_TORCHDATA", "false").lower() == "true":
+            LOGGER.info(f"Use torchdata datapipes")
+            from torchdata.datapipes.iter import IterableWrapper
+            collate_fn=getattr(dataset, 'collate_fn', None)
+            dp = IterableWrapper(dataset)
+            if shuffle:
+                dp = dp.shuffle()
+            dp = dp.sharding_filter()
+            dp = dp.batch(batch)
+            dp = dp.collate(collate_fn)
+            num_batches = len(dp)
+            dp = dp.pin_memory()
+
+            mp_rs = MultiProcessingReadingService(num_workers=nw)
+            if rank != -1:
+                dist_rs = DistributedReadingService()
+                rs = SequentialReadingService(dist_rs, mp_rs)
+            else:
+                rs = mp_rs
+
+            dl = DataLoader2(dp, [Shuffle(shuffle)], reading_service=rs)
+            dl.num_workers = nw
+            dl.batch_size = batch
+            dl.num_batches = num_batches
+            dl.num_samples = len(dataset)
+            return dl
+        else:
+            return InfiniteDataLoader(dataset=dataset,
+                                batch_size=batch,
+                                shuffle=shuffle and sampler is None,
+                                num_workers=nw,
+                                sampler=sampler,
+                                pin_memory=PIN_MEMORY,
+                                collate_fn=getattr(dataset, 'collate_fn', None),
+                                worker_init_fn=seed_worker,
+                                generator=generator)
 
 
 def check_source(source):

@@ -194,7 +194,7 @@ class Model:
             verbose (bool): Controls verbosity.
         """
         self._check_is_pytorch_model()
-        return self.model.info(detailed=detailed, verbose=verbose)
+        return self.model.info(detailed=detailed, verbose=verbose, imgsz=self.cfg.imgsz)
 
     def fuse(self):
         """Fuse PyTorch Conv2d and BatchNorm2d layers."""
