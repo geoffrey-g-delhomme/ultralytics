@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import dataloader, distributed
+from torch.utils.data import dataloader, distributed, SequentialSampler
 
 from ultralytics.data.loaders import (LOADERS, LoadImages, LoadPilAndNumpy, LoadScreenshots, LoadStreams, LoadTensor,
                                       SourceTypes, autocast_list)
@@ -15,12 +15,13 @@ from ultralytics.data.utils import IMG_FORMATS, VID_FORMATS
 from ultralytics.utils import RANK, colorstr
 from ultralytics.utils.checks import check_file
 
-from .dataset import YOLODataset, get_wds_dataset
+from .dataset import YOLODataset, get_wds_dataset, YOLOIterDataset
 from .utils import PIN_MEMORY, LOGGER
 
 from torchdata.dataloader2 import DataLoader2
 from torchdata.dataloader2.adapter import Shuffle
 from torchdata.dataloader2.reading_service import DistributedReadingService, MultiProcessingReadingService, SequentialReadingService
+import math
 
 
 class InfiniteDataLoader(dataloader.DataLoader):
@@ -78,8 +79,13 @@ def build_yolo_dataset(cfg, img_path, batch, data, mode='train', rect=False, str
     if cfg.cache == "wds":
         return get_wds_dataset(cfg, img_path, batch, data, mode, rect, stride)
     else:
-        # return YOLODataset(
-        return YOLOIterDataset(
+        if os.environ.get("USE_TORCHDATA", "false").lower() == "true":
+            dataset_class = YOLOIterDataset
+        else:
+            dataset_class = YOLODataset
+        import time
+        tic = time.perf_counter()
+        dataset = dataset_class(
             img_path=img_path,
             imgsz=cfg.imgsz,
             batch_size=batch,
@@ -96,6 +102,9 @@ def build_yolo_dataset(cfg, img_path, batch, data, mode='train', rect=False, str
             classes=cfg.classes,
             data=data,
             fraction=cfg.fraction if mode == 'train' else 1.0)
+        LOGGER.info(f"dataset: {time.perf_counter() - tic:.2f} s")
+        return dataset
+
 
 
 def build_dataloader(dataset, batch, workers, shuffle=True, rank=-1):
@@ -109,67 +118,24 @@ def build_dataloader(dataset, batch, workers, shuffle=True, rank=-1):
     sampler = None if rank == -1 else distributed.DistributedSampler(dataset, shuffle=shuffle)
     generator = torch.Generator()
     generator.manual_seed(6148914691236517205 + RANK)
-    if isinstance(dataset, torch.utils.data.IterDataPipe):
-        collate_fn = getattr(dataset, 'collate_fn', None)
-        # dp = dataset.sharding_filter()
-        dp = dataset
-        num_samples = len(dp)
-        dp = dp.batch(batch)
-        dp = dp.collate(collate_fn)
-        num_batches = len(dp)
-        dp = dp.pin_memory()
-        # dp = dp.fullsync()
+    if isinstance(dataset, torch.utils.data.IterDataPipe) or isinstance(dataset, torch.utils.data.MapDataPipe):
 
-        mp_rs = MultiProcessingReadingService(num_workers=nw)
-        if rank != -1:
-            dist_rs = DistributedReadingService()
-            rs = SequentialReadingService(dist_rs, mp_rs)
-        else:
-            rs = mp_rs
-
-        dl = DataLoader2(dp, [Shuffle(shuffle)], reading_service=rs)
-        dl.num_workers = nw
-        dl.batch_size = batch
-        dl.num_batches = num_batches
-        dl.num_samples = num_samples
-        return dl
-    # if isinstance(dataset, torch.utils.data.IterDataPipe):DistributedReadingService
-    #     collate_fn = getattr(dataset, 'collate_fn', None)
-    #     dp = dataset
-    #     # dp = dp.batch(batch)
-    #     # dp = dp.collate(collate_fn)
-    #     LOGGER.info(f"dataset length: {len(dp)}")
-    #     # TODO: Apply distributed sharding here ?
-    #     # TODO: Check worker sharding next ?
-    #     torch.utils.data.graph_settings.apply_shuffle_settings(dp, shuffle=shuffle)
-    #     dl = dataloader.DataLoader(dataset=dp,
-    #                         #   prefetch_factor=4,
-    #                           batch_size=batch,
-    #                         #   shuffle=False,
-    #                           num_workers=nw,
-    #                           pin_memory=PIN_MEMORY,
-    #                           collate_fn=collate_fn,
-    #                           drop_last=True,
-    #                         #   worker_init_fn=seed_worker,
-    #                         #   generator=generator
-    #                           )
-    #     LOGGER.info("dataloader created")
-    #     return dl
-    else:
-        if os.environ.get("USE_TORCHDATA", "false").lower() == "true":
+        if os.environ.get("USE_DATALOADER2", "false").lower() == "true":
             LOGGER.info(f"Use torchdata datapipes")
-            from torchdata.datapipes.iter import IterableWrapper
-            collate_fn=getattr(dataset, 'collate_fn', None)
-            dp = IterableWrapper(dataset)
-            if shuffle:
-                dp = dp.shuffle()
-            dp = dp.sharding_filter()
-            dp = dp.batch(batch)
-            dp = dp.collate(collate_fn)
-            num_batches = len(dp)
+
+            from torchdata.datapipes.iter import Header, Batcher, Collator
+
+            dp = dataset.datapipe
+            num_batches = math.ceil(len(dataset) / batch)
+            dp = Batcher(dp, batch)
+            dp = Header(dp, limit=num_batches)
+            dp = Collator(dp, dataset.collate_fn)
             dp = dp.pin_memory()
 
-            mp_rs = MultiProcessingReadingService(num_workers=nw)
+            mp_rs = MultiProcessingReadingService(
+                num_workers=nw, 
+                worker_prefetch_cnt=4, 
+                main_prefetch_cnt=4)
             if rank != -1:
                 dist_rs = DistributedReadingService()
                 rs = SequentialReadingService(dist_rs, mp_rs)
@@ -177,21 +143,43 @@ def build_dataloader(dataset, batch, workers, shuffle=True, rank=-1):
                 rs = mp_rs
 
             dl = DataLoader2(dp, [Shuffle(shuffle)], reading_service=rs)
+            dl.dataset = dataset
             dl.num_workers = nw
-            dl.batch_size = batch
-            dl.num_batches = num_batches
-            dl.num_samples = len(dataset)
             return dl
         else:
-            return InfiniteDataLoader(dataset=dataset,
-                                batch_size=batch,
-                                shuffle=shuffle and sampler is None,
-                                num_workers=nw,
-                                sampler=sampler,
-                                pin_memory=PIN_MEMORY,
-                                collate_fn=getattr(dataset, 'collate_fn', None),
-                                worker_init_fn=seed_worker,
-                                generator=generator)
+            if isinstance(dataset, torch.utils.data.IterDataPipe):
+                dl = InfiniteDataLoader(dataset=dataset,
+                                    #   prefetch_factor=4,
+                                    batch_size=batch,
+                                    #   shuffle=False,
+                                    num_workers=nw,
+                                    pin_memory=PIN_MEMORY,
+                                    collate_fn=dataset.collate_fn,
+                                    # drop_last=True,
+                                    #   worker_init_fn=seed_worker,
+                                    #   generator=generator
+                                    )
+            else:
+                dl = InfiniteDataLoader(dataset=dataset,
+                            batch_size=batch,
+                            shuffle=shuffle and sampler is None,
+                            num_workers=nw,
+                            sampler=sampler,
+                            pin_memory=PIN_MEMORY,
+                            collate_fn=getattr(dataset, 'collate_fn', None),
+                            worker_init_fn=seed_worker,
+                            generator=generator)
+        return dl
+    else:
+        return InfiniteDataLoader(dataset=dataset,
+                            batch_size=batch,
+                            shuffle=shuffle and sampler is None,
+                            num_workers=nw,
+                            sampler=sampler,
+                            pin_memory=PIN_MEMORY,
+                            collate_fn=getattr(dataset, 'collate_fn', None),
+                            worker_init_fn=seed_worker,
+                            generator=generator)
 
 
 def check_source(source):

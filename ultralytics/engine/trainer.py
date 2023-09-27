@@ -26,7 +26,7 @@ from tqdm import tqdm
 from ultralytics.cfg import get_cfg
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.nn.tasks import attempt_load_one_weight, attempt_load_weights
-from ultralytics.utils import (DEFAULT_CFG, LOGGER, RANK, SETTINGS, TQDM_BAR_FORMAT, __version__, callbacks, clean_url,
+from ultralytics.utils import (LOCAL_RANK, WORLD_SIZE, DEFAULT_CFG, LOGGER, RANK, SETTINGS, TQDM_BAR_FORMAT, __version__, callbacks, clean_url,
                                colorstr, emojis, yaml_save)
 from ultralytics.utils.autobatch import check_train_batch_size
 from ultralytics.utils.checks import check_amp, check_file, check_imgsz, print_args
@@ -36,6 +36,7 @@ from ultralytics.utils.torch_utils import (EarlyStopping, ModelEMA, de_parallel,
                                            strip_optimizer)
 
 from torchdata.dataloader2 import DataLoader2
+from torchdata.datapipes.iter import IterDataPipe
 
 
 class BaseTrainer:
@@ -170,7 +171,9 @@ class BaseTrainer:
 
     def train(self):
         """Allow device='', device=None on Multi-GPU systems to default to device=0."""
-        if isinstance(self.args.device, int) or self.args.device:  # i.e. device=0 or device=[0,1,2,3]
+        if "WORLD_SIZE" in os.environ:
+            world_size = WORLD_SIZE
+        elif isinstance(self.args.device, int) or self.args.device:  # i.e. device=0 or device=[0,1,2,3]
             world_size = torch.cuda.device_count()
         elif torch.cuda.is_available():  # i.e. device=None or device=''
             world_size = 1  # default to device 0
@@ -197,11 +200,11 @@ class BaseTrainer:
 
     def _setup_ddp(self, world_size):
         """Initializes and sets the DistributedDataParallel parameters for training."""
-        torch.cuda.set_device(RANK)
-        self.device = torch.device('cuda', RANK)
-        LOGGER.info(f'DDP info: RANK {RANK}, WORLD_SIZE {world_size}, DEVICE {self.device}')
+        torch.cuda.set_device(LOCAL_RANK)
+        self.device = torch.device('cuda', LOCAL_RANK)
+        print(f'DDP info: RANK {RANK}, LOCAL_RANK {LOCAL_RANK}, WORLD_SIZE {world_size}, DEVICE {self.device}')
         os.environ['NCCL_BLOCKING_WAIT'] = '1'  # set to enforce timeout
-        nccl_timeout_s = 10800 # 3h
+        nccl_timeout_s = 10800  # 3h
         if "NCCL_INIT_TIMEOUT" in os.environ:
             nccl_timeout_s = int(os.environ['NCCL_INIT_TIMEOUT'])
             LOGGER.info(f"Set NCCL init timeout to {nccl_timeout_s} seconds")
@@ -244,11 +247,13 @@ class BaseTrainer:
             self.amp = torch.tensor(check_amp(self.model), device=self.device)
             callbacks.default_callbacks = callbacks_backup  # restore callbacks
         if RANK > -1 and world_size > 1:  # DDP
+            print(f'broadcast: RANK {RANK}, LOCAL_RANK {LOCAL_RANK}, WORLD_SIZE {world_size}, DEVICE {self.device}')
             dist.broadcast(self.amp, src=0)  # broadcast the tensor from rank 0 to all other ranks (returns None)
+        print(f'broadcast ok: RANK {RANK}, LOCAL_RANK {LOCAL_RANK}, WORLD_SIZE {world_size}, DEVICE {self.device}')
         self.amp = bool(self.amp)  # as boolean
         self.scaler = amp.GradScaler(enabled=self.amp)
         if world_size > 1:
-            self.model = DDP(self.model, device_ids=[RANK])
+            self.model = DDP(self.model, device_ids=[LOCAL_RANK])
 
         # Check imgsz
         gs = max(int(self.model.stride.max() if hasattr(self.model, 'stride') else 32), 32)  # grid size (max stride)
@@ -277,13 +282,7 @@ class BaseTrainer:
         # Optimizer
         self.accumulate = max(round(self.args.nbs / self.batch_size), 1)  # accumulate loss before optimizing
         weight_decay = self.args.weight_decay * self.batch_size * self.accumulate / self.args.nbs  # scale weight_decay
-        if isinstance(self.train_loader, DataLoader2):
-            LOGGER.info(f"Train dataloader num_batches {self.train_loader.num_batches}")
-            LOGGER.info(f"Train dataloader batch_size {self.train_loader.batch_size}")
-            LOGGER.info(f"Train dataloader num_samples {self.train_loader.num_samples}")
-            iterations = math.ceil(self.train_loader.num_batches / world_size) * self.epochs
-        else:
-            iterations = math.ceil(len(self.train_loader.dataset) / max(self.batch_size, self.args.nbs)) * self.epochs
+        iterations = math.ceil(len(self.train_loader.dataset) / max(self.batch_size, self.args.nbs)) * self.epochs
         self.optimizer = self.build_optimizer(model=self.model,
                                               name=self.args.optimizer,
                                               lr=self.args.lr0,
@@ -310,8 +309,8 @@ class BaseTrainer:
         self.epoch_time = None
         self.epoch_time_start = time.time()
         self.train_time_start = time.time()
-        if isinstance(self.train_loader, DataLoader2):
-            nb = math.ceil(self.train_loader.num_batches / world_size)
+        if isinstance(self.train_loader, DataLoader2) or isinstance(self.train_loader.dataset, IterDataPipe):
+            nb = math.ceil(len(self.train_loader.dataset) / self.args.batch)
         else:
             nb = len(self.train_loader)  # number of batches
         nw = max(round(self.args.warmup_epochs *
@@ -336,6 +335,11 @@ class BaseTrainer:
             # Update dataloader attributes (optional)
             if epoch == (self.epochs - self.args.close_mosaic):
                 LOGGER.info('Closing dataloader mosaic')
+                # if hasattr(self.train_loader.dataset, 'mosaic'):
+                #     self.train_loader.dataset.mosaic = False
+                # if hasattr(self.train_loader.dataset, 'close_mosaic'):
+                #     self.train_loader.dataset.close_mosaic(hyp=self.args)
+                # self.train_loader.reset()
                 if not isinstance(self.train_loader, DataLoader2):
                     if hasattr(self.train_loader.dataset, 'mosaic'):
                         self.train_loader.dataset.mosaic = False

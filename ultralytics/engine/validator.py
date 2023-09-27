@@ -20,6 +20,7 @@ Usage - formats:
 """
 import json
 import time
+import math
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +37,7 @@ from ultralytics.utils.ops import Profile
 from ultralytics.utils.torch_utils import de_parallel, select_device, smart_inference_mode
 
 from torchdata.dataloader2 import DataLoader2
+from torchdata.datapipes.iter import IterDataPipe
 
 
 class BaseValidator:
@@ -161,8 +163,8 @@ class BaseValidator:
             model.warmup(imgsz=(1 if pt else self.args.batch, 3, imgsz, imgsz))  # warmup
 
         dt = Profile(), Profile(), Profile(), Profile()
-        if isinstance(self.dataloader, DataLoader2):
-            n_batches = self.dataloader.num_batches
+        if isinstance(self.dataloader, DataLoader2) or isinstance(self.dataloader.dataset, IterDataPipe):
+            n_batches = len(self.dataloader.dataset) // self.args.batch + 1
         else:
             n_batches = len(self.dataloader)
         desc = self.get_desc()
@@ -200,17 +202,14 @@ class BaseValidator:
             self.run_callbacks('on_val_batch_end')
         stats = self.get_stats()
         self.check_stats(stats)
-        if isinstance(self.dataloader, DataLoader2):
-            self.speed = dict(zip(self.speed.keys(), (x.t / self.dataloader.num_samples * 1E3 for x in dt)))
-        else:
-            self.speed = dict(zip(self.speed.keys(), (x.t / len(self.dataloader.dataset) * 1E3 for x in dt)))
+        self.speed = dict(zip(self.speed.keys(), (x.t / len(self.dataloader.dataset) * 1E3 for x in dt)))
         self.finalize_metrics()
         self.print_results()
         self.run_callbacks('on_val_end')
         if self.training:
             model.float()
-            if isinstance(self.dataloader, DataLoader2):
-                results = {**stats, **trainer.label_loss_items(self.loss.cpu() / self.dataloader.num_batches, prefix='val')}
+            if isinstance(self.dataloader, DataLoader2) or isinstance(self.dataloader.dataset, IterDataPipe):
+                results = {**stats, **trainer.label_loss_items(self.loss.cpu() / math.ceil(len(self.dataloader.dataset)/self.args.batch), prefix='val')}
             else:
                 results = {**stats, **trainer.label_loss_items(self.loss.cpu() / len(self.dataloader), prefix='val')}
             return {k: round(float(v), 5) for k, v in results.items()}  # return results as 5 decimal place floats

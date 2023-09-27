@@ -16,7 +16,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, RANK, __version__
+from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, LOCAL_RANK, RANK, __version__
 from ultralytics.utils.checks import check_version
 
 try:
@@ -32,11 +32,17 @@ TORCH_2_0 = check_version(torch.__version__, '2.0.0')
 def torch_distributed_zero_first(local_rank: int):
     """Decorator to make all processes in distributed training wait for each local_master to do something."""
     initialized = torch.distributed.is_available() and torch.distributed.is_initialized()
+    if local_rank != -1:
+        local_rank = RANK
     if initialized and local_rank not in (-1, 0):
-        dist.barrier(device_ids=[local_rank])
+        print(f'barrier: RANK {RANK}, LOCAL_RANK {LOCAL_RANK}')
+        dist.barrier(device_ids=[LOCAL_RANK])
+        print(f'barrier ok: RANK {RANK}, LOCAL_RANK {LOCAL_RANK}')
     yield
     if initialized and local_rank == 0:
-        dist.barrier(device_ids=[0])
+        print(f'barrier: RANK {RANK}, LOCAL_RANK {LOCAL_RANK}')
+        dist.barrier(device_ids=[LOCAL_RANK])
+        print(f'barrier ok: RANK {RANK}, LOCAL_RANK {LOCAL_RANK}')
 
 
 def smart_inference_mode():

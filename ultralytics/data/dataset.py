@@ -8,6 +8,7 @@ import copy
 import torchvision.transforms as transforms
 import PIL.Image
 import torchdata
+import pyarrow as pa
 
 import cv2
 import numpy as np
@@ -16,6 +17,7 @@ import torchvision
 from tqdm import tqdm
 import webdataset as wds
 import io
+import typing
 import json
 import os
 from functools import partial
@@ -32,9 +34,11 @@ import torchvision.transforms as T
 from ultralytics.utils.ops import segments2boxes
 import random
 import math
-from torchdata.datapipes.iter import IterDataPipe, FileLister, FileOpener, LineReader, ParagraphAggregator, Mapper, Dropper, Zipper, RoutedDecoder, Shuffler, ShardingFilter, UnZipper, Header, Batcher, Collator
+from torchdata.datapipes.iter import IterDataPipe, FileLister, FileOpener, LineReader, ParagraphAggregator, Mapper, Dropper, Zipper, RoutedDecoder, Shuffler, ShardingFilter, UnZipper, Header, Batcher, Collator, LengthSetter, IoPathFileLister, IoPathFileOpener, IterableWrapper, Sampler, ShardingRoundRobinDispatcher, ZipperLongest
+from torchdata.datapipes.map import MapDataPipe
 from torch.utils.data.datapipes.utils.decoder import imagehandler, mathandler
-from typing import List, TypeVar, Tuple, Optional, Iterator
+from torch.utils.data.datapipes.iter.sharding import SHARDING_PRIORITIES
+from typing import List, TypeVar, Tuple, Optional, Iterator, Sized
 
 # Ultralytics dataset *.cache version, >= 1.0.0 for YOLOv8
 DATASET_CACHE_VERSION = '1.0.3'
@@ -212,7 +216,7 @@ class YOLODataset(BaseDataset):
         new_batch['batch_idx'] = torch.cat(new_batch['batch_idx'], 0)
         return new_batch
 
-class RandomMultiBufferIterDataPipe(IterDataPipe[T_co]):
+class RandomQueryBuffer(IterDataPipe[T_co]):
     """
     Buffer samples and return m tuple of n samples, the first one being the last yield by the datapipe,
     and the others randomly picked by the buffer.
@@ -221,48 +225,44 @@ class RandomMultiBufferIterDataPipe(IterDataPipe[T_co]):
 
     datapipe: IterDataPipe[T_co]
     buffer_size: int
-    n: int
-    m: int
     _buffer: List[T_co]
     _seed: Optional[int]
     _rng: random.Random
     
-    def __init__(self, datapipe: IterDataPipe[T_co], buffer_size: int = 1_000, m: int = 2, n: int = 4, seed: Optional[int] = None):
+    def __init__(self, datapipe: IterDataPipe[T_co], buffer_size: int = 1_000, seed: Optional[int] = None):
         super().__init__()
         assert buffer_size > 0, "buffer_size should be larger than 0"
-        assert n > 0, "n should be larger than 0"
         self.datapipe = datapipe
         self.buffer_size = buffer_size
-        self.n = n
-        self.m = m
         self._buffer: List[T_co] = []
         self._seed = seed
         self._rng = random.Random(self._seed)
 
     def __iter__(self) -> Iterator[Tuple[Tuple[T_co, ...], ...]]:
         for x in self.datapipe:
-            samples = []
-            for i in range(self.m):
-                s = (x,) if i == 0 else (self._buffer[self._rng.randint(0, len(self._buffer) - 1)],)
-                if not len(self._buffer):
-                    samples.append(s + tuple(x for i in range(self.n-1)))
-                else:
-                    samples.append(s + tuple(self._buffer[self._rng.randint(0, len(self._buffer) - 1)] for i in range(self.n-1)))
-                if len(self._buffer) == self.buffer_size:
-                    self._buffer[self._rng.randint(0, len(self._buffer) - 1)] = x
-                else:
-                    self._buffer.append(x)
-            yield copy.deepcopy(tuple(samples))
+            if len(self._buffer) == self.buffer_size:
+                self._buffer.pop(self._rng.randint(0, len(self._buffer) - 1))
+            self._buffer.append(x)
+            yield copy.deepcopy(x)
+
+    def __len__(self) -> int:
+        if isinstance(self.datapipe, Sized):
+            return len(self.datapipe)
 
     def reset(self) -> None:
         self._buffer.clear()
+
+    def query(self, n):
+        samples = []
+        for _ in range(n):
+            s = copy.deepcopy(self._buffer[random.randint(0, len(self._buffer) - 1)])
+            samples.append(s)
+        return tuple(samples)
 
     def __getstate__(self):
         state = (
             self.datapipe,
             self.buffer_size,
-            self.m,
-            self.n,
             self._seed,
             self._buffer,
             self._rng.getstate(),
@@ -277,8 +277,6 @@ class RandomMultiBufferIterDataPipe(IterDataPipe[T_co]):
         (
             self.datapipe,
             self.buffer_size,
-            self.m,
-            self.n,
             self._seed,
             self._buffer,
             rng_state,
@@ -293,9 +291,10 @@ class RandomMultiBufferIterDataPipe(IterDataPipe[T_co]):
 
 class Mosaic:
 
-    def __init__(self, imgsz: int, n: int = 4, p: float = 1.0):
+    def __init__(self, dp, imgsz: int, n: int = 4, p: float = 1.0):
         assert n in (4, 9), "grid must be equal to 4 or 9"
         assert 0 <= p <= 1.0, f'The probability should be in range [0, 1], but got {p}.'
+        self.dp = dp
         self.imgsz = imgsz
         self.n = n
         self.p = p
@@ -335,8 +334,10 @@ class Mosaic:
         mosaic_labels = []
         s = self.imgsz
         yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.border)  # mosaic center x, y
-        for i, labels_patch in enumerate(labels):
-            labels_patch = copy.deepcopy(labels_patch)
+        res = self.dp.query(3)
+        assert len(res) == 3
+        l = (labels,) + res
+        for i, labels_patch in enumerate(l):
             # Load image
             img = labels_patch['img']
             h, w = labels_patch['resized_shape']
@@ -370,7 +371,10 @@ class Mosaic:
         mosaic_labels = []
         s = self.imgsz
         hp, wp = -1, -1  # height, width previous
-        for i, labels_patch in enumerate(labels):
+        res = self.dp.query(3)
+        assert len(res) == 3
+        l = (labels,) + res
+        for i, labels_patch in enumerate(l):
             # Load image
             img = labels_patch['img']
             h, w = labels_patch['resized_shape']
@@ -413,9 +417,8 @@ class Mosaic:
         return final_labels
 
     def __call__(self, labels):
-        assert len(labels) == self.n, f"number of samples in feeding datapipes {len(labels)} is not consistent with grid size {self.n}"
         if random.uniform(0, 1) > self.p:
-            return labels[0]
+            return labels
         else:
             if self.n == 4:
                 return self._mosaic4(labels)
@@ -425,21 +428,67 @@ class Mosaic:
 
 class MixUp:
 
-    def __init__(self, p=0.5):
+    def __init__(self, dp, transforms, p=0.5):
+        self.dp = dp
+        self.transforms = transforms
         self.p = p
 
     def __call__(self, labels):
-        assert len(labels) == 2, "mixup expect 2 labels at the same time"
-        labels, labels2 = labels
-        labels = copy.deepcopy(labels)
-        r = np.random.beta(32.0, 32.0)  # mixup ratio, alpha=beta=32.0
-        labels['img'] = (labels['img'] * r + labels2['img'] * (1 - r)).astype(np.uint8)
-        labels['instances'] = Instances.concatenate([labels['instances'], labels2['instances']], axis=0)
-        labels['cls'] = np.concatenate([labels['cls'], labels2['cls']], 0)
-        return labels
+        if random.uniform(0, 1) > self.p:
+            return labels
+        else:
+            labels2 = self.transforms(self.dp.query(1)[0])
+            r = np.random.beta(32.0, 32.0)  # mixup ratio, alpha=beta=32.0
+            labels['img'] = (labels['img'] * r + labels2['img'] * (1 - r)).astype(np.uint8)
+            labels['instances'] = Instances.concatenate([labels['instances'], labels2['instances']], axis=0)
+            labels['cls'] = np.concatenate([labels['cls'], labels2['cls']], 0)
+            return labels
 
 
+class Buffer:
+
+    def __init__(self, buffer_size: int):
+        self.buffer_size = buffer_size
+        self._buffer = []
+
+    def append(self, x):
+        if len(self._buffer) == self.buffer_size:
+            self._buffer.pop(random.randint(0, self.buffer_size - 1))
+        self._buffer.append(x)
+
+    def query(self, n):
+        samples = []
+        for _ in range(n):
+            s = copy.deepcopy(self._buffer[random.randint(0, len(self._buffer) - 1)])
+            samples.append(s)
+        return tuple(samples)
+
+
+class StringArray:
+    def __init__(self, strings : typing.List[str], encoding : typing.Literal['ascii', 'utf_16_le', 'utf_32_le'] = 'utf_16_le'):
+        strings = list(strings)
+        self.encoding = encoding
+        self.multiplier = dict(ascii = 1, utf_16_le = 2, utf_32_le = 4)[encoding]
+        self.data = torch.ByteTensor(torch.ByteStorage.from_buffer(''.join(strings).encode(encoding)))
+        self.cumlen = torch.LongTensor(list(map(len, strings))).cumsum(dim = 0).mul_(self.multiplier)
+        assert int(self.cumlen[-1]) == len(self.data), f'[{encoding}] is not enough to hold characters, use a larger character class'
+    
+    def tolist(self):
+        data_bytes, cumlen = bytes(self.data), self.cumlen.tolist()
+        return [data_bytes[0:cumlen[0]].decode(self.encoding)] + [data_bytes[start:end].decode(self.encoding) for start, end in zip(cumlen[:-1], cumlen[1:])]
+
+    def __getitem__(self, i):
+        return bytes(self.data[(self.cumlen[i - 1] if i >= 1 else 0) : self.cumlen[i]]).decode(self.encoding)
+
+    def __len__(self):
+        return len(self.cumlen)
+
+
+# class YOLOIterDataset(IterableDataset):
 class YOLOIterDataset(IterDataPipe):
+# class YOLOIterDatasetx(MapDataPipe):
+# from torch.utils.data import Dataset
+# class YOLOIterDataset(Dataset):
 
     def __init__(self,
                  img_path,
@@ -458,7 +507,7 @@ class YOLOIterDataset(IterDataPipe):
                  data=None,
                  use_segments=False,
                  use_keypoints=False,
-                 shuffle_buffer_size=1e5):
+                 shuffle_buffer_size=None):
         super().__init__()
         self.img_path = img_path
         self.imgsz = imgsz
@@ -467,11 +516,19 @@ class YOLOIterDataset(IterDataPipe):
         self.prefix = prefix
         self.fraction = fraction
         self.classes = classes
+        # self.images_filepaths = [self.img_path + os.sep + f for f in os.listdir(img_path)]
+        # self.ni = len(self.images_filepaths) # number of images
+        if os.environ.get("USE_ITERABLE_DATASOURCE", "false").lower() != "true":
+            # Encoding must be fixed
+            self.images_filepaths = pa.array([self.img_path + os.sep + f for f in os.listdir(img_path)])
+            self.ni = len(self.images_filepaths) # number of images
+        else:
+            self.ni = len(os.listdir(img_path))
+        # self.labels_filepaths = img2label_paths(self.images_filepaths)
         # self.im_files = self.get_img_files(self.img_path)
         # self.labels = self.get_labels()
         # self.update_labels(include_class=classes)  # single_cls and include_class
         # self.ni = len(self.labels)  # number of images
-        self.ni = len(os.listdir(img_path)) # number of images
         self.rect = rect
         self.batch_size = batch_size
         self.stride = stride
@@ -479,36 +536,43 @@ class YOLOIterDataset(IterDataPipe):
         self.use_segments = use_segments
         self.use_keypoints = use_keypoints
         self.data = data
-        self.shuffle_buffer_size = shuffle_buffer_size
+        self.random_query_buffer_size = self.batch_size * 10
         if self.rect:
             raise NotImplementedError("Rectangle mode not supported")
             # assert self.batch_size is not None
             # self.set_rectangle()
 
         # Buffer thread for mosaic images
-        self.buffer = []  # buffer size = batch size #TODO: Implement mosaic later
-        self.max_buffer_length = min((self.ni, self.batch_size * 8, 1000)) if self.augment else 0 #TODO: Implement mosaic later
+        # self.buffer = []  # buffer size = batch size
+        # self.max_buffer_length = min((self.ni, self.batch_size * 8, 1000)) if self.augment else 0
 
         # Cache stuff
         # if cache == 'ram' and not self.check_cache_ram():
         #     cache = False
-        # self.ims, self.im_hw0, self.im_hw = [None] * self.ni, [None] * self.ni, [None] * self.ni #TODO: needed?
-        # self.npy_files = [Path(f).with_suffix('.npy') for f in self.im_files] #TODO: needed?
+        # self.ims, self.im_hw0, self.im_hw = [None] * self.ni, [None] * self.ni, [None] * self.ni
+        # self.npy_files = [Path(f).with_suffix('.npy') for f in self.im_files]
         # if cache:
         #     self.cache_images(cache)
 
         # Transforms
-        # self.transforms = self.build_transforms(hyp=hyp)
         self.datapipe = self.build_datapipe(hyp=hyp)
+        # self._setup_transforms(hyp=hyp)
+        self.collate_fn = YOLODataset.collate_fn
 
     #TODO: From BaseDataset
     def __len__(self):
         return self.ni
-    
-    # def v8_transforms(self, imgsz, hyp, stretch=False):
-    #     """Convert images to a size suitable for YOLOv8 training."""
-    #     pre_transform = Compose([
-    #         Mosaic(self, imgsz=imgsz, p=hyp.mosaic),
+
+    def close_mosaic(self, hyp):
+        for transform in self._transforms.transforms:
+            if isinstance(transform, Mosaic) or isinstance(transform, CopyPaste) or isinstance(transform, MixUp):
+                transform.p = 0.0
+        self._mixup.p = 0.0
+
+    # def _setup_transforms(self, hyp):
+    #     self._buffer = Buffer(self.batch_size * 10)
+    #     self._transforms = torchvision.transforms.Compose([
+    #         Mosaic(dp=self._buffer, n=4, imgsz=self.imgsz, p=hyp.mosaic if self.augment else 0.0),
     #         CopyPaste(p=hyp.copy_paste),
     #         RandomPerspective(
     #             degrees=hyp.degrees,
@@ -516,122 +580,117 @@ class YOLOIterDataset(IterDataPipe):
     #             scale=hyp.scale,
     #             shear=hyp.shear,
     #             perspective=hyp.perspective,
-    #             pre_transform=None if stretch else LetterBox(new_shape=(imgsz, imgsz)),
-    #         )])
-    #     flip_idx = self.data.get('flip_idx', [])  # for keypoints augmentation
-    #     if self.use_keypoints:
-    #         kpt_shape = self.data.get('kpt_shape', None)
-    #         if len(flip_idx) == 0 and hyp.fliplr > 0.0:
-    #             hyp.fliplr = 0.0
-    #             LOGGER.warning("WARNING ⚠️ No 'flip_idx' array defined in data.yaml, setting augmentation 'fliplr=0.0'")
-    #         elif flip_idx and (len(flip_idx) != kpt_shape[0]):
-    #             raise ValueError(f'data.yaml flip_idx={flip_idx} length must be equal to kpt_shape[0]={kpt_shape[0]}')
-
-    #     return Compose([
-    #         pre_transform,
-    #         MixUp(self, pre_transform=pre_transform, p=hyp.mixup),
+    #             # pre_transform=None if stretch else LetterBox(new_shape=(imgsz, imgsz)), # stretch = False
+    #             pre_transform=LetterBox(new_shape=(self.imgsz, self.imgsz)),
+    #         )
+    #     ])
+    #     self._mixup = MixUp(self._buffer, self._transforms, hyp.mixup)
+    #     self._train_transforms = torchvision.transforms.Compose([
+    #         self._transforms,
+    #         self._mixup,
     #         Albumentations(p=1.0),
     #         RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
-    #         RandomFlip(direction='vertical', p=hyp.flipud),
-    #         RandomFlip(direction='horizontal', p=hyp.fliplr, flip_idx=flip_idx)])  # transforms
+    #         RandomFlip(direction='vertical', p=hyp.flipud)
+    #     ])
 
-    # # TODO: From YOLODataset
-    # def build_transforms(self, hyp=None):
-    #     """Builds and appends transforms to the list."""
+    #     self._valid_transforms = LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)
+
+    #     self._format = Format(
+    #         bbox_format='xywh',
+    #         normalize=True,
+    #         return_mask=self.use_segments,
+    #         return_keypoint=self.use_keypoints,
+    #         batch_idx=True,
+    #         mask_ratio=hyp.mask_ratio,
+    #         mask_overlap=hyp.overlap_mask
+    #     )
+
+
+    # def __getitem__(self, index):
+    #     image_filepath = self.images_filepaths[index]
+    #     keypoint, imgsz, augment, include_class, single_cls = self.use_keypoints, self.imgsz, self.augment, self.classes, self.single_cls or False
+    #     nkpt, ndim = self.data.get('kpt_shape', (0, 0))
+    #     num_cls = len(self.data['names'])
+    #     label = decode(keypoint, imgsz, augment, include_class, single_cls, nkpt, ndim, num_cls, image_filepath)
+    #     self._buffer.append(label)
     #     if self.augment:
-    #         hyp.mosaic = hyp.mosaic if self.augment and not self.rect else 0.0
-    #         hyp.mixup = hyp.mixup if self.augment and not self.rect else 0.0
-    #         transforms = v8_transforms(self, self.imgsz, hyp)
+    #         x = self._train_transforms(label)
     #     else:
-    #         transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)])
-    #     transforms.append(
-    #         Format(bbox_format='xywh',
-    #                normalize=True,
-    #                return_mask=self.use_segments,
-    #                return_keypoint=self.use_keypoints,
-    #                batch_idx=True,
-    #                mask_ratio=hyp.mask_ratio,
-    #                mask_overlap=hyp.overlap_mask))
-    #     return transforms
+    #         x = self._valid_transforms(label)
+    #     return self._format(x)
+        
 
-    # TODO: Implement close_mosaic() -> reference Mosaic / CopyPaste / MixUp and set p=0.0
-    def close_mosaic(self, hyp):
-        # TODO: Duplicated from YOLODataset, to replace
-        """Sets mosaic, copy_paste and mixup options to 0.0 and builds transformations."""
-        hyp.mosaic = 0.0  # set mosaic ratio=0.0
-        hyp.copy_paste = 0.0  # keep the same behavior as previous v8 close-mosaic
-        hyp.mixup = 0.0  # keep the same behavior as previous v8 close-mosaic
+    def build_datapipe(self, hyp):
+        self._transforms = []
 
-    def buid_datapipe(self, hyp):
-        labels_dirpath = self.img_path.replace('/images/', '/labels/')
+        if os.environ.get("USE_ITERABLE_DATASOURCE", "false").lower() != "true":
+            dp = IterableWrapper(self.images_filepaths) # (image filepath)
+            dp = LengthSetter(dp, self.ni)
+        else:
+            dp = FileLister(self.img_path) # (image filepath)
 
-        images_dp = FileLister(self.img_path) # (filepath)
-        labels_dp = FileLister(labels_dirpath) # (filepath)
-        dp = Zipper(images_dp, labels_dp)
         if self.fraction != 1.0:
             dp = Header(dp, int(self.fraction*self.ni))
-        dp = Shuffler(dp, buffer_size=self.shuffle_buffer_size)
+
+        dp = Shuffler(dp, buffer_size=self.ni)
         dp = ShardingFilter(dp)
-        images_dp, labels_dp = UnZipper(dp, sequence_length=2)
 
-        images_dp = FileOpener(images_dp, mode="b") # (filepath, stream)
-        images_dp = RoutedDecoder(images_dp, imagehandler('rgb8')) # (filepath, numpy 255 uint8 image)
-
-        labels_dp = FileOpener(labels_dp) # (filepath, stream)
-        labels_dp = LineReader(labels_dp, strip_newline=True) # (filepath, line)
-        labels_dp = ParagraphAggregator(labels_dp, joiner=lambda ls: ls) # (filepath, lines)
-
-        dp = Zipper(images_dp, labels_dp) # ((image filepath, numpy 255 uint8 image), (label filepath, lines))
-        keypoint, imgsz, augment, include_class, single_cls = self.use_keypoints, self.imgsz, self.augment, self.classes, self.single_cls or False
+        keypoint, imgsz, include_class, single_cls = self.use_keypoints, self.imgsz, self.classes, self.single_cls or False
+        augment = self.augment and os.environ.get("DISABLE_AUGMENT", "false").lower() != "true"
         nkpt, ndim = self.data.get('kpt_shape', (0, 0))
         num_cls = len(self.data['names'])
         dp = Mapper(dp, partial(decode, keypoint, imgsz, augment, include_class, single_cls, nkpt, ndim, num_cls)) # labels dict
-        if self.augment:
-            dp = RandomMultiBufferIterDataPipe(dp, buffer_size=100, m=2, n=4) # (labels dict)*n
-            dp1, dp2 = UnZipper(dp, sequence_length=2)
-            # TODO: Implement close_mosaic() -> reference Mosaic / CopyPaste / MixUp and set p=0.0
-            def pre_transform(dp, hyp, imgsz, augment):
-                dp = Mapper(dp, Mosaic(n=4, imgsz=imgsz, p=hyp.mosaic if augment else 0.0)) # labels dict
-                dp = Mapper(dp, CopyPaste(p=hyp.copy_paste)) # labels dict
-                dp = Mapper(dp, RandomPerspective(
-                            degrees=hyp.degrees,
-                            translate=hyp.translate,
-                            scale=hyp.scale,
-                            shear=hyp.shear,
-                            perspective=hyp.perspective,
-                            # pre_transform=None if stretch else LetterBox(new_shape=(imgsz, imgsz)), # stretch = False
-                            pre_transform=LetterBox(new_shape=(imgsz, imgsz)),
-                        )) # labels dict
-                return dp
 
-            dp = Zipper(pre_transform(dp1, hyp, imgsz, augment), pre_transform(dp2, hyp, imgsz, augment))
-            dp = Mapper(dp, MixUp(hyp.mixup))
+        if augment:
+            dp = RandomQueryBuffer(dp, buffer_size=self.random_query_buffer_size)
+            self._transforms = torchvision.transforms.Compose([
+                Mosaic(dp=dp, n=4, imgsz=imgsz, p=hyp.mosaic if augment else 0.0),
+                CopyPaste(p=hyp.copy_paste),
+                RandomPerspective(
+                    degrees=hyp.degrees,
+                    translate=hyp.translate,
+                    scale=hyp.scale,
+                    shear=hyp.shear,
+                    perspective=hyp.perspective,
+                    # pre_transform=None if stretch else LetterBox(new_shape=(imgsz, imgsz)), # stretch = False
+                    pre_transform=LetterBox(new_shape=(imgsz, imgsz)),
+                )
+            ])
+            self._mixup = MixUp(dp, self._transforms, hyp.mixup)
+            dp = Mapper(dp, self._transforms)
+            dp = Mapper(dp, self._mixup)
             dp = Mapper(dp, Albumentations(p=1.0))
             dp = Mapper(dp, RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v))
             dp = Mapper(dp, RandomFlip(direction='vertical', p=hyp.flipud))
             # TODO: Implement flip_idx logic from v8_transforms
-            # dp = Mapper(dp, RandomFlip(direction='horizontal', p=hyp.fliplr, flip_idx=flip_idx))
+            dp = Mapper(dp, RandomFlip(direction='horizontal', p=hyp.fliplr))
         else:
             dp = Mapper(dp, LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False))
-        dp = Mapper(dp, Format(bbox_format='xywh',
-                        normalize=True,
-                        return_mask=self.use_segments,
-                        return_keypoint=self.use_keypoints,
-                        batch_idx=True,
-                        mask_ratio=hyp.mask_ratio,
-                        mask_overlap=hyp.overlap_mask))
-
-        dp = Batcher(dp, self.batch_size)
-        dp = Collator(dp, YOLODataset.collate_fn)
+        
+        dp = Mapper(dp, Format(
+            bbox_format='xywh',
+            normalize=True,
+            return_mask=self.use_segments,
+            return_keypoint=self.use_keypoints,
+            batch_idx=True,
+            mask_ratio=hyp.mask_ratio,
+            mask_overlap=hyp.overlap_mask)
+        )
 
         return dp
 
     def __iter__(self):
-        # TODO: CONTINUE HERE
         yield from self.datapipe
 
+
 def decode(keypoint, imgsz, augment, include_class, single_cls, nkpt, ndim, num_cls, entry):
-    (image_filepath, cv_image), (label_filepath, lines) = entry
+    # image_filepath, label_filepath = entry
+    image_filepath = str(entry)
+    label_filepath = img2label_paths([image_filepath])[0]
+    cv_image = cv2.imread(image_filepath) # BGR
+    with open(label_filepath) as f:
+        lines = f.read().strip().splitlines()
+    # (image_filepath, cv_image), (label_filepath, lines) = entry
     # TODO: implement 'verify_image_label'
     segments = []
     shape = cv_image.shape[:2] # hw
@@ -685,7 +744,7 @@ def decode(keypoint, imgsz, augment, include_class, single_cls, nkpt, ndim, num_
         cls=lb[:, 0:1], # n, 1
         bboxes=lb[:, 1:], # n, 4
         segments=segments,
-        keypoints=keypoints,
+        keypoints=keypoints if keypoint else None,
         normalized=True,
         bbox_format='xywh'
     )
